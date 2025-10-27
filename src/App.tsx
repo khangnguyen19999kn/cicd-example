@@ -8,7 +8,7 @@ function App() {
           React + TypeScript + Tailwind
         </h1>
         <p className="text-gray-600 mb-6">
-          Project lỏ
+          Thử nghiệm CICD với React, TypeScript và Tailwind CSS.
         </p>
         <button className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
           Get Started
