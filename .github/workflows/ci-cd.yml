@@ -1,6 +1,4 @@
-name: CI/CD Pipeline
-permissions:
-  contents: write
+name: CI/CD to S3 + CloudFront
 
 on:
   push:
@@ -8,34 +6,83 @@ on:
   pull_request:
     branches: [main]
 
+# Cho OIDC: cần id-token: write (để assume role), và chỉ cần đọc code
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
-          cache: "npm"
+          node-version: 18
+          cache: npm
+
       - run: npm ci
-      - run: npm run build
+
+
+      - name: Build (force root assets)
+        run: |
+          PUBLIC_URL=/ npm run build
+
+      # (Optional) Lưu artifact build để job deploy dùng lại (đỡ build lần 2)
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: build
 
   deploy:
     needs: test
-    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
         with:
-          node-version: "18"
-          cache: "npm"
-      - run: npm ci
-      - run: npm run build
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+          name: web-build
+          path: build
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./build
+          role-to-assume: ${{ secrets.ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync build to S3
+        run: |
+          aws s3 sync ./build s3://$S3_BUCKET_NAME --delete
+        env:
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+
+      - name: Set Cache-Control headers
+        run: |
+          aws s3 cp s3://$S3_BUCKET_NAME/static/ s3://$S3_BUCKET_NAME/static/ \
+            --recursive --metadata-directive REPLACE \
+            --cache-control "public, max-age=31536000, immutable" || true
+
+          aws s3 cp s3://$S3_BUCKET_NAME/index.html s3://$S3_BUCKET_NAME/index.html \
+            --metadata-directive REPLACE \
+            --cache-control "no-cache, no-store, must-revalidate"
+        env:
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+
+      # Invalidate CloudFront để client nhận bản mới
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
+        env:
+          DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
