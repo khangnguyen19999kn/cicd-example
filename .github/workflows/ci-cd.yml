@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-# Cho OIDC: cần id-token: write (để assume role), và chỉ cần đọc code
+# OIDC cần id-token: write; chỉ đọc code là đủ
 permissions:
   id-token: write
   contents: read
@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +29,11 @@ jobs:
 
       - run: npm ci
 
-
+      # Không có test thì chỉ build
       - name: Build (force root assets)
         run: |
           PUBLIC_URL=/ npm run build
 
-      # (Optional) Lưu artifact build để job deploy dùng lại (đỡ build lần 2)
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -42,7 +41,7 @@ jobs:
           path: build
 
   deploy:
-    needs: test
+    needs: build
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
@@ -54,31 +53,56 @@ jobs:
           name: web-build
           path: build
 
+      # AWS credentials qua OIDC (không cần access key)
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # 1) Đồng bộ build lên S3 (xóa file cũ)
       - name: Sync build to S3
         run: |
-          aws s3 sync ./build s3://$S3_BUCKET_NAME --delete
+          aws s3 sync ./build s3://$S3_BUCKET_NAME --delete --exact-timestamps
         env:
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
+      # 2) Đảm bảo Content-Type đúng để tránh trình duyệt tải file thay vì render
+      - name: Fix Content-Type metadata
+        run: |
+          # HTML
+          aws s3 cp s3://$S3_BUCKET_NAME s3://$S3_BUCKET_NAME \
+            --recursive --exclude "*" --include "*.html" \
+            --metadata-directive REPLACE --content-type "text/html"
+
+          # CSS
+          aws s3 cp s3://$S3_BUCKET_NAME s3://$S3_BUCKET_NAME \
+            --recursive --exclude "*" --include "*.css" \
+            --metadata-directive REPLACE --content-type "text/css"
+
+          # JS
+          aws s3 cp s3://$S3_BUCKET_NAME s3://$S3_BUCKET_NAME \
+            --recursive --exclude "*" --include "*.js" \
+            --metadata-directive REPLACE --content-type "application/javascript"
+        env:
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+
+      # 3) Cache headers: static cache dài, index.html không cache
       - name: Set Cache-Control headers
         run: |
+          # static assets: cache 1 năm + immutable
           aws s3 cp s3://$S3_BUCKET_NAME/static/ s3://$S3_BUCKET_NAME/static/ \
             --recursive --metadata-directive REPLACE \
             --cache-control "public, max-age=31536000, immutable" || true
 
+          # index.html: no-cache để nhận bản mới ngay
           aws s3 cp s3://$S3_BUCKET_NAME/index.html s3://$S3_BUCKET_NAME/index.html \
             --metadata-directive REPLACE \
             --cache-control "no-cache, no-store, must-revalidate"
         env:
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
-      # Invalidate CloudFront để client nhận bản mới
+      # 4) Invalidate CloudFront
       - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
